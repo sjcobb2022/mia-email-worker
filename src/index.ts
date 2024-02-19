@@ -5,40 +5,45 @@ import * as utils from './utils';
 interface Bindings {
     // MongoDB Realm Application ID
     REALM_APPID: string;
-}
-
-// Define type alias; available via `realm-web`
-type Document = globalThis.Realm.Services.MongoDB.Document;
-
-// Declare the interface for a "todos" document
-interface Todo extends Document {
-    owner: string;
-    done: boolean;
-    todo: string;
+    REALM_APIKEY: string;
+    MJ_APIKEY_PUBLIC: string;
+    MJ_APIKEY_PRIVATE: string;
 }
 
 let App: Realm.App;
 const ObjectId = Realm.BSON.ObjectID;
 
+// Define type alias; available via `realm-web`
+type Document = globalThis.Realm.Services.MongoDB.Document;
+
+interface Schedule extends Document {
+    name: string;
+    start_date: Date;
+    interval: number;
+    active: boolean;
+    formId: Realm.BSON.ObjectID;
+}
+
+interface ScheduleOnUser extends Document {
+    scheduleId: Realm.BSON.ObjectID;
+    userId: string;
+    type: string;
+}
+
+interface User extends Document {
+    name: string;
+    email: string;
+    type: "User" | "Admin";
+}
+
+
 // Define the Worker logic
 const worker: ExportedHandler<Bindings> = {
     async fetch(req, env) {
-        const url = new URL(req.url);
         App = App || new Realm.App(env.REALM_APPID);
 
-        const method = req.method;
-        const path = url.pathname.replace(/[/]$/, '');
-        const todoID = url.searchParams.get('id') || '';
-
-        if (path !== '/api/todos') {
-            return utils.toError(`Unknown "${path}" URL; try "/api/todos" instead.`, 404);
-        }
-
-        const token = req.headers.get('authorization');
-        if (!token) return utils.toError('Missing "authorization" header; try to add the header "authorization: REALM_API_KEY".', 401);
-
         try {
-            const credentials = Realm.Credentials.apiKey(token);
+            const credentials = Realm.Credentials.apiKey(env.REALM_APIKEY);
             // Attempt to authenticate
             var user = await App.logIn(credentials);
             var client = user.mongoClient('mongodb-atlas');
@@ -46,66 +51,76 @@ const worker: ExportedHandler<Bindings> = {
             return utils.toError('Error with authentication.', 500);
         }
 
-        // Grab a reference to the "cloudflare.todos" collection
-        const collection = client.db('cloudflare').collection<Todo>('todos');
+        const schedules = client.db('db').collection<Schedule>('Schedule');
 
-        try {
-            if (method === 'GET') {
-                if (todoID) {
-                    // GET /api/todos?id=XXX
-                    return utils.reply(
-                        await collection.findOne({
-                            _id: new ObjectId(todoID)
-                        })
-                    );
-                }
+        const today_m = new Date();
+        today_m.setSeconds(0);
+        today_m.setHours(0);
+        today_m.setMinutes(0);
 
-                // GET /api/todos
-                return utils.reply(
-                    await collection.find()
-                );
+        const today_e = new Date(today_m);
+
+        today_e.setHours(23);
+        today_e.setMinutes(59);
+        today_e.setSeconds(59);
+
+        const sched = await schedules.find({
+            "start_date": {
+                $gte: today_m,
+                $lte: today_e
             }
+        });
 
-            // POST /api/todos
-            if (method === 'POST') {
-                const {todo} = await req.json();
-                return utils.reply(
-                    await collection.insertOne({
-                        owner: user.id,
-                        done: false,
-                        todo: todo,
-                    })
-                );
+        const schedOnUsers = client.db('db').collection<ScheduleOnUser>('ScheduleOnUser');
+
+        const users = await schedOnUsers.find({
+            "scheduleId": {
+                $in: sched.map(s => s._id)
             }
+        });
 
-            // PATCH /api/todos?id=XXX&done=true
-            if (method === 'PATCH') {
-                return utils.reply(
-                    await collection.updateOne({
-                        _id: new ObjectId(todoID)
-                    }, {
-                        $set: {
-                            done: url.searchParams.get('done') === 'true'
-                        }
-                    })
-                );
-            }
+        const mailableUsers = await client.db('db').collection<User>('User').find({
+            _id: {
+                $in: users.map(u => u.userId)
+            },
+            type: "User"
+        });
 
-            // DELETE /api/todos?id=XXX
-            if (method === 'DELETE') {
-                return utils.reply(
-                    await collection.deleteOne({
-                        _id: new ObjectId(todoID)
-                    })
-                );
-            }
+        const emails = mailableUsers.map(u => u.email);
 
-            // unknown method
-            return utils.toError('Method not allowed.', 405);
-        } catch (err) {
-            const msg = (err as Error).message || 'Error with query.';
-            return utils.toError(msg, 500);
+        const encoded = btoa(`${env.MJ_APIKEY_PUBLIC}:${env.MJ_APIKEY_PRIVATE}`);
+
+        const response = await fetch('https://api.mailjet.com/v3.1/send', {
+            method: 'POST',
+            headers: {
+                Authorization: `Basic ${encoded}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                "Messages": [
+                    {
+                        "From": {
+                            "Email": "shoporders@mercyinaction.org.uk",
+                            "Name": "MIA Stock Orders"
+                        },
+                        "To": emails.map(e => {
+                            return {
+                                "Email": e
+                            };
+                        }),
+                        "Subject": "Please place your stock orders",
+                        "HTMLPart": "<h3>It's time to place your stock orders</h3><p>Hi there, it's time to place your stock orders. Please login <a href='https://mercyinaction-shoporders.pages.dev/'>here</a> to place your orders.</p>"
+                    }
+                ]
+            }),
+        });
+
+        if (!response.ok) {
+            utils.toError('Error sending emails', 500);
         }
+
+        return utils.reply(response);
+
     }
 }
 

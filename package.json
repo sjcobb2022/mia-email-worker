@@ -6,6 +6,7 @@
     "types": "tsc --noEmit --skipLibCheck"
   },
   "dependencies": {
+    "node-mailjet": "^6.0.5",
     "realm-web": "^1.5.1"
   },
   "devDependencies": {
